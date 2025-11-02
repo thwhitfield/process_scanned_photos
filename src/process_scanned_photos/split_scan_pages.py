@@ -95,7 +95,7 @@ def _detect_page_quad(bgr, debug=False):
     return page_quad
 
 
-def _auto_trim(white_bgr, margin_px=0):
+def _auto_trim(white_bgr, margin_px=0, lightness_offset=18.0):
     """Trim uniform borders from a (already-warped) page; add margin."""
     h, w = white_bgr.shape[:2]
     lab = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2LAB)
@@ -105,7 +105,7 @@ def _auto_trim(white_bgr, margin_px=0):
     center_slice = lightness[h // 5 : h * 4 // 5, w // 5 : w * 4 // 5]
     page_level = float(np.median(center_slice))
     # Allow for mild shading while keeping the desk/background (darker) excluded.
-    threshold = max(0.0, min(255.0, page_level - 18.0))
+    threshold = max(0.0, min(255.0, page_level - float(lightness_offset)))
     bright_mask = (lightness >= threshold).astype(np.uint8) * 255
 
     # Close gaps from scribbles/crosshatching, then remove thin spillover.
@@ -198,7 +198,13 @@ def _deskew_small_angle(bgr):
     return rotated
 
 
-def straighten_and_crop_page(pil_img, margin_trim_px=8, pad_px=12, small_deskew=True):
+def straighten_and_crop_page(
+    pil_img,
+    margin_trim_px=8,
+    pad_px=12,
+    small_deskew=True,
+    trim_lightness_offset=18.0,
+):
     """
     1) Honor EXIF orientation.
     2) Detect page quadrilateral and perspective-warp to top-down.
@@ -215,7 +221,9 @@ def straighten_and_crop_page(pil_img, margin_trim_px=8, pad_px=12, small_deskew=
     else:
         warped = bgr  # fallback: use as-is
 
-    trimmed = _auto_trim(warped, margin_px=margin_trim_px)
+    trimmed = _auto_trim(
+        warped, margin_px=margin_trim_px, lightness_offset=trim_lightness_offset
+    )
     if small_deskew:
         trimmed = _deskew_small_angle(trimmed)
     padded = _ensure_min_margin(trimmed, pad_px=pad_px, bg_color=255)
@@ -225,22 +233,39 @@ def straighten_and_crop_page(pil_img, margin_trim_px=8, pad_px=12, small_deskew=
 
 
 # ---------- splitting ----------
-def split_image_center(pil_img, mode="vertical", gutter_px=0):
+def split_image_center(pil_img, mode="vertical", gutter_px=0, overlap_px=0):
     """
-    Split at midpoint. Optional gutter removes pixels around the center seam.
+    Split at midpoint.
+    - gutter removes pixels around the center seam.
+    - overlap keeps the central area on both halves (positive values undo gutter).
     Returns two PIL images.
     """
     w, h = pil_img.size
+    gutter_px = max(0, int(gutter_px))
+    overlap_px = max(0, int(overlap_px))
+
     if mode == "vertical":
         mid = w // 2
-        left_box = (0, 0, mid - gutter_px // 2, h)
-        right_box = (mid + math.ceil(gutter_px / 2), 0, w, h)
+        left_end = mid - gutter_px // 2 + overlap_px
+        right_start = mid + math.ceil(gutter_px / 2) - overlap_px
+
+        left_end = max(1, min(w, left_end))
+        right_start = max(0, min(w - 1, right_start))
+
+        left_box = (0, 0, left_end, h)
+        right_box = (right_start, 0, w, h)
         a = pil_img.crop(left_box)
         b = pil_img.crop(right_box)
     else:
         mid = h // 2
-        top_box = (0, 0, w, mid - gutter_px // 2)
-        bot_box = (0, mid + math.ceil(gutter_px / 2), w, h)
+        top_end = mid - gutter_px // 2 + overlap_px
+        bottom_start = mid + math.ceil(gutter_px / 2) - overlap_px
+
+        top_end = max(1, min(h, top_end))
+        bottom_start = max(0, min(h - 1, bottom_start))
+
+        top_box = (0, 0, w, top_end)
+        bot_box = (0, bottom_start, w, h)
         a = pil_img.crop(top_box)
         b = pil_img.crop(bot_box)
     return a, b
@@ -267,6 +292,8 @@ def run_split_scan_pages(
     gutter: int = 0,
     trim: int = 8,
     pad: int = 12,
+    trim_offset: float = 18.0,
+    overlap: int = 0,
     overwrite: bool = False,
     suffixes: str = "L,R",
 ) -> int:
@@ -278,8 +305,10 @@ def run_split_scan_pages(
         output_dir: Folder to write split images
         mode: Split direction ("vertical" or "horizontal")
         gutter: Pixels removed around the center seam
-        trim: Pixels to trim from background content (adaptive)
+        trim: Extra pixels to re-include around detected content
         pad: Pixels of clean white margin to add after trimming
+        trim_offset: Lightness offset for detecting the page (larger keeps more page)
+        overlap: Pixels of overlap to retain around the seam when splitting
         overwrite: Whether to overwrite existing outputs
         suffixes: Comma-separated suffixes for halves (e.g., "L,R")
 
@@ -319,10 +348,16 @@ def run_split_scan_pages(
             with Image.open(img_path) as im:
                 # 1) straighten + crop page
                 fixed = straighten_and_crop_page(
-                    im, margin_trim_px=trim, pad_px=pad, small_deskew=True
+                    im,
+                    margin_trim_px=trim,
+                    pad_px=pad,
+                    small_deskew=True,
+                    trim_lightness_offset=trim_offset,
                 )
                 # 2) split
-                a, b = split_image_center(fixed, mode=mode, gutter_px=gutter)
+                a, b = split_image_center(
+                    fixed, mode=mode, gutter_px=gutter, overlap_px=overlap
+                )
 
                 stem = img_path.stem
                 # Write HEIC/HEIF as JPEG for portability
@@ -373,13 +408,25 @@ def main():
         "--trim",
         type=int,
         default=8,
-        help="Trim this many pixels of background content (adaptive) (default: 8)",
+        help="Re-include this many pixels around detected content (default: 8)",
     )
     ap.add_argument(
         "--pad",
         type=int,
         default=12,
         help="Add this many pixels of clean white margin after trimming (default: 12)",
+    )
+    ap.add_argument(
+        "--trim-offset",
+        type=float,
+        default=18.0,
+        help="Lightness offset for page detection; increase to keep more of the page (default: 18)",
+    )
+    ap.add_argument(
+        "--overlap",
+        type=int,
+        default=0,
+        help="Pixels of overlap around the seam so both halves retain shared area (default: 0)",
     )
     ap.add_argument(
         "--overwrite", action="store_true", help="Overwrite existing outputs"
@@ -396,6 +443,8 @@ def main():
         gutter=args.gutter,
         trim=args.trim,
         pad=args.pad,
+        trim_offset=args.trim_offset,
+        overlap=args.overlap,
         overwrite=args.overwrite,
         suffixes=args.suffixes,
     )

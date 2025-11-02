@@ -12,6 +12,8 @@ def process_journal_pipeline(
     gutter: int = 0,
     trim: int = 8,
     pad: int = 12,
+    trim_offset: float = 18.0,
+    overlap: int = 0,
     suffixes: str = "L,R",
     scale: float = 1.0,
     max_width: int | None = None,
@@ -32,6 +34,8 @@ def process_journal_pipeline(
         gutter: Pixels removed around the center seam
         trim: Pixels to trim from background content (adaptive)
         pad: Pixels of clean white margin to add after trimming
+        trim_offset: Lightness offset for detecting the page (larger keeps more page)
+        overlap: Pixels of overlap retained around the seam when splitting
         suffixes: Comma-separated suffixes for halves (e.g., "L,R")
         scale: Uniform scale factor for PDF images
         max_width: Max width in pixels for PDF images
@@ -68,6 +72,8 @@ def process_journal_pipeline(
             gutter=gutter,
             trim=trim,
             pad=pad,
+            trim_offset=trim_offset,
+            overlap=overlap,
             overwrite=True,
             suffixes=suffixes,
         )
@@ -128,6 +134,18 @@ def main():
         "--pad", type=int, default=12, help="Pixels of white margin to add"
     )
     split_group.add_argument(
+        "--trim-offset",
+        type=float,
+        default=18.0,
+        help="Lightness offset for detecting the page; increase to keep more page",
+    )
+    split_group.add_argument(
+        "--overlap",
+        type=int,
+        default=0,
+        help="Pixels of overlap to retain around the split seam",
+    )
+    split_group.add_argument(
         "--suffixes", default="L,R", help="Suffixes for split halves"
     )
 
@@ -165,6 +183,8 @@ def main():
         gutter=args.gutter,
         trim=args.trim,
         pad=args.pad,
+        trim_offset=args.trim_offset,
+        overlap=args.overlap,
         suffixes=args.suffixes,
         scale=args.scale,
         max_width=args.max_width,
