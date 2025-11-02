@@ -228,7 +228,97 @@ def is_image_path(p: Path) -> bool:
     }
 
 
-# ---------- main ----------
+def run_split_scan_pages(
+    input_dir: Path,
+    output_dir: Path,
+    mode: str = "vertical",
+    gutter: int = 0,
+    trim: int = 8,
+    pad: int = 12,
+    overwrite: bool = False,
+    suffixes: str = "L,R",
+) -> int:
+    """
+    Process scanned images: detect, straighten, crop, and split.
+
+    Args:
+        input_dir: Folder with images to process
+        output_dir: Folder to write split images
+        mode: Split direction ("vertical" or "horizontal")
+        gutter: Pixels removed around the center seam
+        trim: Pixels to trim from background content (adaptive)
+        pad: Pixels of clean white margin to add after trimming
+        overwrite: Whether to overwrite existing outputs
+        suffixes: Comma-separated suffixes for halves (e.g., "L,R")
+
+    Returns:
+        Total number of images written
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    left_suf, right_suf = (s.strip() for s in suffixes.split(",", 1))
+
+    # Optional HEIC support
+    try:
+        import pillow_heif  # type: ignore
+
+        pillow_heif.register_heif_opener()
+    except Exception:
+        pass
+
+    # natural-ish filename sort
+    def sort_key(p: Path):
+        import re
+
+        return [
+            int(t) if t.isdigit() else t.lower() for t in re.findall(r"\d+|\D+", p.name)
+        ]
+
+    images = sorted(
+        [p for p in input_dir.iterdir() if p.is_file() and is_image_path(p)],
+        key=sort_key,
+    )
+    if not images:
+        print("No images found.")
+        return 0
+
+    total = 0
+    for img_path in images:
+        try:
+            with Image.open(img_path) as im:
+                # 1) straighten + crop page
+                fixed = straighten_and_crop_page(
+                    im, margin_trim_px=trim, pad_px=pad, small_deskew=True
+                )
+                # 2) split
+                a, b = split_image_center(fixed, mode=mode, gutter_px=gutter)
+
+                stem = img_path.stem
+                # Write HEIC/HEIF as JPEG for portability
+                ext_in = img_path.suffix.lower()
+                ext_out = ".jpg" if ext_in in {".heic", ".heif"} else ext_in
+
+                out_a = output_dir / f"{stem}_{left_suf}{ext_out}"
+                out_b = output_dir / f"{stem}_{right_suf}{ext_out}"
+
+                if not overwrite and (out_a.exists() or out_b.exists()):
+                    print(f"Skipping (exists): {img_path.name}")
+                    continue
+
+                save_kwargs = {}
+                if ext_out in {".jpg", ".jpeg"}:
+                    save_kwargs = {"quality": 95, "subsampling": 2, "optimize": True}
+
+                a.save(out_a, **save_kwargs)
+                b.save(out_b, **save_kwargs)
+                print(f"Processed: {img_path.name} -> {out_a.name}, {out_b.name}")
+                total += 2
+        except Exception as e:
+            print(f"ERROR: {img_path.name}: {e}")
+
+    print(f"Done. Wrote {total} split images to {output_dir}")
+    return total
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="Detect, straighten, crop, and split journal images."
@@ -267,69 +357,16 @@ def main():
     )
     args = ap.parse_args()
 
-    out_dir = args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    left_suf, right_suf = (s.strip() for s in args.suffixes.split(",", 1))
-
-    # Optional HEIC support
-    try:
-        import pillow_heif  # type: ignore
-
-        pillow_heif.register_heif_opener()
-    except Exception:
-        pass
-
-    # natural-ish filename sort
-    def sort_key(p: Path):
-        import re
-
-        return [
-            int(t) if t.isdigit() else t.lower() for t in re.findall(r"\d+|\D+", p.name)
-        ]
-
-    images = sorted(
-        [p for p in args.input_dir.iterdir() if p.is_file() and is_image_path(p)],
-        key=sort_key,
+    run_split_scan_pages(
+        input_dir=args.input_dir,
+        output_dir=args.output_dir,
+        mode=args.mode,
+        gutter=args.gutter,
+        trim=args.trim,
+        pad=args.pad,
+        overwrite=args.overwrite,
+        suffixes=args.suffixes,
     )
-    if not images:
-        print("No images found.")
-        return
-
-    total = 0
-    for img_path in images:
-        try:
-            with Image.open(img_path) as im:
-                # 1) straighten + crop page
-                fixed = straighten_and_crop_page(
-                    im, margin_trim_px=args.trim, pad_px=args.pad, small_deskew=True
-                )
-                # 2) split
-                a, b = split_image_center(fixed, mode=args.mode, gutter_px=args.gutter)
-
-                stem = img_path.stem
-                # Write HEIC/HEIF as JPEG for portability
-                ext_in = img_path.suffix.lower()
-                ext_out = ".jpg" if ext_in in {".heic", ".heif"} else ext_in
-
-                out_a = out_dir / f"{stem}_{left_suf}{ext_out}"
-                out_b = out_dir / f"{stem}_{right_suf}{ext_out}"
-
-                if not args.overwrite and (out_a.exists() or out_b.exists()):
-                    print(f"Skipping (exists): {img_path.name}")
-                    continue
-
-                save_kwargs = {}
-                if ext_out in {".jpg", ".jpeg"}:
-                    save_kwargs = {"quality": 95, "subsampling": 2, "optimize": True}
-
-                a.save(out_a, **save_kwargs)
-                b.save(out_b, **save_kwargs)
-                print(f"Processed: {img_path.name} -> {out_a.name}, {out_b.name}")
-                total += 2
-        except Exception as e:
-            print(f"ERROR: {img_path.name}: {e}")
-
-    print(f"Done. Wrote {total} split images to {out_dir}")
 
 
 if __name__ == "__main__":
