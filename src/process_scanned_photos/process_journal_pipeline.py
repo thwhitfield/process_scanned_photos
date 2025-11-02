@@ -1,8 +1,8 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from .images_to_pdf import convert_images_to_pdf
-from .split_scan_pages import run_split_scan_pages
+from process_scanned_photos.images_to_pdf import convert_images_to_pdf
+from process_scanned_photos.split_scan_pages import run_split_scan_pages
 
 
 def process_journal_pipeline(
