@@ -96,33 +96,66 @@ def _detect_page_quad(bgr, debug=False):
 
 
 def _deskew_small_angle(bgr):
-    """Optional tiny deskew using text lines. Tries HoughLines; safe for near-upright pages."""
+    """Deskew by detecting dominant near-vertical structures via multiple Hough variants."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    edges = cv2.Canny(gray, 50, 150)
-    lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=200)
-    if lines is None:
-        return bgr
-    angles = []
-    for rho_theta in lines[:80]:
-        rho, theta = rho_theta[0]
-        # Convert to degrees and normalize near horizontal
-        deg = theta * 180.0 / np.pi
-        # Map to [-90, 90)
-        deg = (deg + 90) % 180 - 90
-        if -45 < deg < 45:
-            angles.append(deg)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    edges = cv2.Canny(blur, 40, 160)
+    thresh = cv2.adaptiveThreshold(
+        blur,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35,
+        9,
+    )
+    vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 45))
+    seam_enhanced = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, vertical_kernel, iterations=1)
+    combined = cv2.bitwise_or(edges, seam_enhanced)
+
+    angles: list[float] = []
+    weights: list[float] = []
+
+    primary = _collect_hough_angles(combined)
+    angles.extend(primary)
+    weights.extend([1.0] * len(primary))
+
+    if len(angles) < 5:
+        refined_edges = cv2.Canny(seam_enhanced, 30, 120)
+        secondary = _collect_hough_angles(refined_edges, max_lines=240)
+        angles.extend(secondary)
+        weights.extend([0.8] * len(secondary))
+
+    prob_angles, prob_weights = _collect_houghp_angles(combined)
+    angles.extend(prob_angles)
+    weights.extend(prob_weights)
+
     if not angles:
         return bgr
-    angle = np.median(angles)
-    if abs(angle) < 0.4:  # don't over-rotate
+
+    angles_np = np.array(angles, dtype=np.float32)
+    weights_np = np.array(weights, dtype=np.float32)
+    median = np.median(angles_np)
+    mask = np.abs(angles_np - median) <= 6.0
+    if mask.sum() >= 3:
+        angles_np = angles_np[mask]
+        weights_np = weights_np[mask]
+
+    total_weight = float(weights_np.sum())
+    if total_weight <= 1e-6:
+        angle = float(np.median(angles_np))
+    else:
+        angle = float(np.sum(angles_np * weights_np) / total_weight)
+
+    angle = float(np.clip(angle, -10.0, 10.0))
+    if abs(angle) < 0.15:  # negligible
         return bgr
-    # rotate
+
     h, w = bgr.shape[:2]
     M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
-    rotated = cv2.warpAffine(
+    return cv2.warpAffine(
         bgr, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
     )
-    return rotated
 
 
 def _normalize_profile(profile: np.ndarray) -> np.ndarray:
@@ -135,6 +168,54 @@ def _normalize_profile(profile: np.ndarray) -> np.ndarray:
     else:
         prof[:] = 0.0
     return prof
+
+
+def _theta_to_vertical(theta_rad: float) -> float:
+    """Convert Hough theta (normal angle) to deviation from vertical in degrees."""
+    deg = theta_rad * 180.0 / np.pi
+    return (deg + 90.0) % 180.0 - 90.0
+
+
+def _collect_hough_angles(edge_map: np.ndarray, max_lines: int = 180) -> list[float]:
+    """Return orientation samples (degrees) from standard Hough transform."""
+    angles: list[float] = []
+    threshold = max(100, int(0.18 * min(edge_map.shape[:2])))
+    lines = cv2.HoughLines(edge_map, 1, np.pi / 180.0, threshold=threshold)
+    if lines is None:
+        return angles
+    for rho_theta in lines[:max_lines]:
+        theta = float(rho_theta[0][1])
+        angle = _theta_to_vertical(theta)
+        if abs(angle) <= 20.0:
+            angles.append(angle)
+    return angles
+
+
+def _collect_houghp_angles(edge_map: np.ndarray) -> tuple[list[float], list[float]]:
+    """Return orientation samples and weights from probabilistic Hough transform."""
+    angles: list[float] = []
+    weights: list[float] = []
+    h, w = edge_map.shape[:2]
+    min_len = max(40, int(0.15 * min(h, w)))
+    max_gap = max(20, int(0.05 * min(h, w)))
+    lines = cv2.HoughLinesP(
+        edge_map,
+        1,
+        np.pi / 180.0,
+        threshold=max(60, int(0.04 * min(h, w))),
+        minLineLength=min_len,
+        maxLineGap=max_gap,
+    )
+    if lines is None:
+        return angles, weights
+    for (x1, y1, x2, y2) in lines[:, 0, :]:
+        angle = math.degrees(math.atan2(y2 - y1, x2 - x1))
+        angle = (angle + 90.0) % 180.0 - 90.0
+        if abs(angle) <= 20.0:
+            length = math.hypot(x2 - x1, y2 - y1)
+            angles.append(angle)
+            weights.append(max(length, 1.0))
+    return angles, weights
 
 
 def _prepare_image_for_split(pil_img, apply_deskew=True):
