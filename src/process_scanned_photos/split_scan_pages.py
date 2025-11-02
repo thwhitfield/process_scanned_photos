@@ -97,27 +97,59 @@ def _detect_page_quad(bgr, debug=False):
 
 def _auto_trim(white_bgr, margin_px=0):
     """Trim uniform borders from a (already-warped) page; add margin."""
-    # Convert to grayscale and find content bbox
-    gray = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2GRAY)
-    # Binary inverse: content (darker ink/lines) becomes white
-    thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    # Clean small specks
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
-    ys, xs = np.where(thr > 0)
-    if len(xs) == 0 or len(ys) == 0:
-        return white_bgr  # nothing detected
+    h, w = white_bgr.shape[:2]
+    lab = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2LAB)
+    lightness = lab[:, :, 0]
 
-    x0, x1 = int(xs.min()), int(xs.max())
-    y0, y1 = int(ys.min()), int(ys.max())
+    # Estimate the typical page tone from the central region (likely page interior).
+    center_slice = lightness[h // 5 : h * 4 // 5, w // 5 : w * 4 // 5]
+    page_level = float(np.median(center_slice))
+    # Allow for mild shading while keeping the desk/background (darker) excluded.
+    threshold = max(0.0, min(255.0, page_level - 18.0))
+    bright_mask = (lightness >= threshold).astype(np.uint8) * 255
 
-    # Apply margin, clipping to image bounds
-    y0 = max(0, y0 - margin_px)
-    x0 = max(0, x0 - margin_px)
-    y1 = min(white_bgr.shape[0] - 1, y1 + margin_px)
-    x1 = min(white_bgr.shape[1] - 1, x1 + margin_px)
+    # Close gaps from scribbles/crosshatching, then remove thin spillover.
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
 
-    cropped = white_bgr[y0 : y1 + 1, x0 : x1 + 1]
-    return cropped
+    coords = cv2.findNonZero(bright_mask)
+    if coords is None:
+        return white_bgr
+
+    x, y, bw, bh = cv2.boundingRect(coords)
+    area_ratio = (bw * bh) / (h * w)
+    if area_ratio < 0.5:
+        return white_bgr
+
+    # If the mask still spans the whole frame, fall back to a text-driven crop.
+    if area_ratio > 0.97:
+        gray = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, text_mask = cv2.threshold(
+            blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+        )
+        text_mask = cv2.morphologyEx(
+            text_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1
+        )
+        coords = cv2.findNonZero(text_mask)
+        if coords is None:
+            return white_bgr
+        tx, ty, tw, th = cv2.boundingRect(coords)
+        text_ratio = (tw * th) / (h * w)
+        if text_ratio < 0.1:
+            return white_bgr
+        x, y, bw, bh = tx, ty, tw, th
+
+    # Add breathing room so we never clip strokes near the page border.
+    expand = margin_px + int(round(min(h, w) * 0.01))
+    x0 = max(0, x - expand)
+    y0 = max(0, y - expand)
+    x1 = min(w, x + bw + expand)
+    y1 = min(h, y + bh + expand)
+
+    return white_bgr[y0:y1, x0:x1]
 
 
 def _ensure_min_margin(bgr, pad_px=0, bg_color=255):
