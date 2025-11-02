@@ -10,10 +10,9 @@ def process_journal_pipeline(
     output_pdf: Path,
     mode: str = "vertical",
     gutter: int = 0,
-    trim: int = 8,
-    pad: int = 12,
-    trim_offset: float = 18.0,
     overlap: int = 0,
+    overlap_frac: float = 0.1,
+    deskew: bool = True,
     suffixes: str = "L,R",
     scale: float = 1.0,
     max_width: int | None = None,
@@ -32,10 +31,9 @@ def process_journal_pipeline(
         output_pdf: Path to output PDF file
         mode: Split direction ("vertical" or "horizontal")
         gutter: Pixels removed around the center seam
-        trim: Pixels to trim from background content (adaptive)
-        pad: Pixels of clean white margin to add after trimming
-        trim_offset: Lightness offset for detecting the page (larger keeps more page)
         overlap: Pixels of overlap retained around the seam when splitting
+        overlap_frac: Fractional overlap to retain on both halves
+        deskew: Whether to attempt a gentle deskew before finding the seam
         suffixes: Comma-separated suffixes for halves (e.g., "L,R")
         scale: Uniform scale factor for PDF images
         max_width: Max width in pixels for PDF images
@@ -70,10 +68,9 @@ def process_journal_pipeline(
             output_dir=temp_dir,
             mode=mode,
             gutter=gutter,
-            trim=trim,
-            pad=pad,
-            trim_offset=trim_offset,
             overlap=overlap,
+            overlap_frac=overlap_frac,
+            deskew=deskew,
             overwrite=True,
             suffixes=suffixes,
         )
@@ -128,22 +125,21 @@ def main():
         "--gutter", type=int, default=0, help="Pixels removed around center seam"
     )
     split_group.add_argument(
-        "--trim", type=int, default=8, help="Pixels to trim from background"
-    )
-    split_group.add_argument(
-        "--pad", type=int, default=12, help="Pixels of white margin to add"
-    )
-    split_group.add_argument(
-        "--trim-offset",
-        type=float,
-        default=18.0,
-        help="Lightness offset for detecting the page; increase to keep more page",
-    )
-    split_group.add_argument(
         "--overlap",
         type=int,
         default=0,
         help="Pixels of overlap to retain around the split seam",
+    )
+    split_group.add_argument(
+        "--overlap-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of the page width/height to keep as overlap on both sides",
+    )
+    split_group.add_argument(
+        "--no-deskew",
+        action="store_true",
+        help="Disable the gentle deskew before seam detection",
     )
     split_group.add_argument(
         "--suffixes", default="L,R", help="Suffixes for split halves"
@@ -181,10 +177,9 @@ def main():
         output_pdf=args.output_pdf,
         mode=args.mode,
         gutter=args.gutter,
-        trim=args.trim,
-        pad=args.pad,
-        trim_offset=args.trim_offset,
         overlap=args.overlap,
+        overlap_frac=args.overlap_frac,
+        deskew=not args.no_deskew,
         suffixes=args.suffixes,
         scale=args.scale,
         max_width=args.max_width,

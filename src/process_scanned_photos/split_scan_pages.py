@@ -95,79 +95,6 @@ def _detect_page_quad(bgr, debug=False):
     return page_quad
 
 
-def _auto_trim(white_bgr, margin_px=0, lightness_offset=18.0):
-    """Trim uniform borders from a (already-warped) page; add margin."""
-    h, w = white_bgr.shape[:2]
-    lab = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2LAB)
-    lightness = lab[:, :, 0]
-
-    # Estimate the typical page tone from the central region (likely page interior).
-    center_slice = lightness[h // 5 : h * 4 // 5, w // 5 : w * 4 // 5]
-    page_level = float(np.median(center_slice))
-    # Allow for mild shading while keeping the desk/background (darker) excluded.
-    threshold = max(0.0, min(255.0, page_level - float(lightness_offset)))
-    bright_mask = (lightness >= threshold).astype(np.uint8) * 255
-
-    # Close gaps from scribbles/crosshatching, then remove thin spillover.
-    close_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE, close_kernel, iterations=1)
-    open_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
-
-    coords = cv2.findNonZero(bright_mask)
-    if coords is None:
-        return white_bgr
-
-    x, y, bw, bh = cv2.boundingRect(coords)
-    area_ratio = (bw * bh) / (h * w)
-    if area_ratio < 0.5:
-        return white_bgr
-
-    # If the mask still spans the whole frame, fall back to a text-driven crop.
-    if area_ratio > 0.97:
-        gray = cv2.cvtColor(white_bgr, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, text_mask = cv2.threshold(
-            blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
-        )
-        text_mask = cv2.morphologyEx(
-            text_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), iterations=1
-        )
-        coords = cv2.findNonZero(text_mask)
-        if coords is None:
-            return white_bgr
-        tx, ty, tw, th = cv2.boundingRect(coords)
-        text_ratio = (tw * th) / (h * w)
-        if text_ratio < 0.1:
-            return white_bgr
-        x, y, bw, bh = tx, ty, tw, th
-
-    # Add breathing room so we never clip strokes near the page border.
-    expand = margin_px + int(round(min(h, w) * 0.01))
-    x0 = max(0, x - expand)
-    y0 = max(0, y - expand)
-    x1 = min(w, x + bw + expand)
-    y1 = min(h, y + bh + expand)
-
-    return white_bgr[y0:y1, x0:x1]
-
-
-def _ensure_min_margin(bgr, pad_px=0, bg_color=255):
-    """Pad with white (or chosen) border to ensure clean frame."""
-    if pad_px <= 0:
-        return bgr
-    h, w = bgr.shape[:2]
-    return cv2.copyMakeBorder(
-        bgr,
-        pad_px,
-        pad_px,
-        pad_px,
-        pad_px,
-        borderType=cv2.BORDER_CONSTANT,
-        value=[bg_color, bg_color, bg_color],
-    )
-
-
 def _deskew_small_angle(bgr):
     """Optional tiny deskew using text lines. Tries HoughLines; safe for near-upright pages."""
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
@@ -198,44 +125,109 @@ def _deskew_small_angle(bgr):
     return rotated
 
 
-def straighten_and_crop_page(
-    pil_img,
-    margin_trim_px=8,
-    pad_px=12,
-    small_deskew=True,
-    trim_lightness_offset=18.0,
-):
-    """
-    1) Honor EXIF orientation.
-    2) Detect page quadrilateral and perspective-warp to top-down.
-    3) Auto-trim a bit of background; add a clean margin (white).
-    4) Optional small-angle deskew (safe).
-    Returns a PIL.Image (RGB).
-    """
-    pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
-    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-
-    quad = _detect_page_quad(bgr)
-    if quad is not None:
-        warped = _four_point_warp(bgr, quad)
+def _normalize_profile(profile: np.ndarray) -> np.ndarray:
+    """Min-max normalize 1D profile safely."""
+    prof = profile.astype(np.float32)
+    prof -= prof.min()
+    max_val = prof.max()
+    if max_val > 1e-6:
+        prof /= max_val
     else:
-        warped = bgr  # fallback: use as-is
+        prof[:] = 0.0
+    return prof
 
-    trimmed = _auto_trim(
-        warped, margin_px=margin_trim_px, lightness_offset=trim_lightness_offset
-    )
-    if small_deskew:
-        trimmed = _deskew_small_angle(trimmed)
-    padded = _ensure_min_margin(trimmed, pad_px=pad_px, bg_color=255)
 
-    rgb = cv2.cvtColor(padded, cv2.COLOR_BGR2RGB)
+def _prepare_image_for_split(pil_img, apply_deskew=True):
+    """Return an RGB PIL image ready for seam detection (EXIF orientation + optional deskew)."""
+    pil_img = ImageOps.exif_transpose(pil_img).convert("RGB")
+    if not apply_deskew:
+        return pil_img
+
+    bgr = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    aligned = _deskew_small_angle(bgr)
+    if aligned is bgr:
+        return pil_img
+    rgb = cv2.cvtColor(aligned, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
 
 
+def _find_split_position(gray, mode="vertical"):
+    """Heuristically locate the spine seam in the grayscale image."""
+    working = gray if mode == "vertical" else gray.T
+    blur = cv2.GaussianBlur(working, (5, 5), 0)
+    h, w = blur.shape
+
+    # Projection profiles
+    column_mean = blur.mean(axis=0).astype(np.float32)
+    edges = cv2.Sobel(blur, cv2.CV_32F, 1, 0, ksize=3)
+    edge_profile = np.mean(np.abs(edges), axis=0)
+
+    # Contrast between left/right windows around each candidate seam.
+    idxs = np.arange(w, dtype=np.int32)
+    window = max(15, int(round(w * 0.04)))
+    if window >= w:
+        window = max(1, w // 2)
+    cumsum = np.concatenate(([0.0], np.cumsum(column_mean, dtype=np.float64)))
+
+    left_start = np.maximum(0, idxs - window)
+    left_sum = cumsum[idxs] - cumsum[left_start]
+    left_count = np.maximum(1, idxs - left_start)
+    left_mean = left_sum / left_count
+
+    right_end = np.minimum(w, idxs + window)
+    right_sum = cumsum[right_end] - cumsum[idxs]
+    right_count = np.maximum(1, right_end - idxs)
+    right_mean = right_sum / right_count
+
+    contrast = np.abs(left_mean - right_mean)
+
+    # Normalize feature profiles and lightly smooth to reduce noise.
+    edge_norm = _normalize_profile(
+        cv2.GaussianBlur(edge_profile.reshape(1, -1), (1, 9), 0).ravel()
+    )
+    contrast_norm = _normalize_profile(
+        cv2.GaussianBlur(contrast.reshape(1, -1), (1, 9), 0).ravel()
+    )
+    dark_norm = _normalize_profile(255.0 - column_mean)
+
+    # Favor central columns to avoid selecting outer edges.
+    center = (w - 1) / 2.0
+    sigma = max(8.0, w * 0.17)
+    center_weight = np.exp(-((idxs - center) ** 2) / (2 * sigma * sigma)).astype(
+        np.float32
+    )
+
+    score = center_weight * (
+        0.6 * edge_norm + 0.3 * contrast_norm + 0.1 * dark_norm
+    )
+
+    start = max(0, int(round(w * 0.18)))
+    end = min(w, int(round(w * 0.82)))
+    if end - start < 15:
+        start, end = 0, w
+
+    window_scores = score[start:end]
+    if window_scores.size == 0 or np.ptp(window_scores) < 1e-3:
+        seam = int(round(center))
+    else:
+        local_idx = int(np.argmax(window_scores))
+        seam = start + local_idx
+
+    seam = int(np.clip(seam, 0, w - 1))
+    return seam if mode == "vertical" else seam
+
+
 # ---------- splitting ----------
-def split_image_center(pil_img, mode="vertical", gutter_px=0, overlap_px=0):
+def split_image_center(
+    pil_img,
+    mode="vertical",
+    gutter_px=0,
+    overlap_px=0,
+    overlap_frac=0.1,
+    auto_seam=True,
+):
     """
-    Split at midpoint.
+    Split the image using a detected seam (or midpoint fallback).
     - gutter removes pixels around the center seam.
     - overlap keeps the central area on both halves (positive values undo gutter).
     Returns two PIL images.
@@ -243,26 +235,51 @@ def split_image_center(pil_img, mode="vertical", gutter_px=0, overlap_px=0):
     w, h = pil_img.size
     gutter_px = max(0, int(gutter_px))
     overlap_px = max(0, int(overlap_px))
+    overlap_frac = max(0.0, float(overlap_frac))
+
+    if auto_seam:
+        gray = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2GRAY)
+        seam = _find_split_position(gray, mode=mode)
+    else:
+        seam = w // 2 if mode == "vertical" else h // 2
 
     if mode == "vertical":
-        mid = w // 2
-        left_end = mid - gutter_px // 2 + overlap_px
-        right_start = mid + math.ceil(gutter_px / 2) - overlap_px
+        base_overlap = int(round(overlap_frac * w))
+        overlap_total = max(overlap_px, base_overlap)
+
+        half_left = seam - gutter_px // 2
+        half_right = seam + math.ceil(gutter_px / 2)
+
+        left_end = min(w, max(0, half_left) + overlap_total)
+        right_start = max(0, min(w, half_right) - overlap_total)
 
         left_end = max(1, min(w, left_end))
         right_start = max(0, min(w - 1, right_start))
+        if right_start > left_end:
+            mid = (right_start + left_end) // 2
+            left_end = max(1, mid)
+            right_start = max(0, mid)
 
         left_box = (0, 0, left_end, h)
         right_box = (right_start, 0, w, h)
         a = pil_img.crop(left_box)
         b = pil_img.crop(right_box)
     else:
-        mid = h // 2
-        top_end = mid - gutter_px // 2 + overlap_px
-        bottom_start = mid + math.ceil(gutter_px / 2) - overlap_px
+        base_overlap = int(round(overlap_frac * h))
+        overlap_total = max(overlap_px, base_overlap)
+
+        half_top = seam - gutter_px // 2
+        half_bottom = seam + math.ceil(gutter_px / 2)
+
+        top_end = min(h, max(0, half_top) + overlap_total)
+        bottom_start = max(0, min(h, half_bottom) - overlap_total)
 
         top_end = max(1, min(h, top_end))
         bottom_start = max(0, min(h - 1, bottom_start))
+        if bottom_start > top_end:
+            mid = (bottom_start + top_end) // 2
+            top_end = max(1, mid)
+            bottom_start = max(0, mid)
 
         top_box = (0, 0, w, top_end)
         bot_box = (0, bottom_start, w, h)
@@ -290,25 +307,23 @@ def run_split_scan_pages(
     output_dir: Path,
     mode: str = "vertical",
     gutter: int = 0,
-    trim: int = 8,
-    pad: int = 12,
-    trim_offset: float = 18.0,
     overlap: int = 0,
+    overlap_frac: float = 0.1,
+    deskew: bool = True,
     overwrite: bool = False,
     suffixes: str = "L,R",
 ) -> int:
     """
-    Process scanned images: detect, straighten, crop, and split.
+    Process scanned images: optionally deskew, locate the seam, and split.
 
     Args:
         input_dir: Folder with images to process
         output_dir: Folder to write split images
         mode: Split direction ("vertical" or "horizontal")
         gutter: Pixels removed around the center seam
-        trim: Extra pixels to re-include around detected content
-        pad: Pixels of clean white margin to add after trimming
-        trim_offset: Lightness offset for detecting the page (larger keeps more page)
         overlap: Pixels of overlap to retain around the seam when splitting
+        overlap_frac: Fraction of page width/height to overlap (each side retains this much)
+        deskew: Whether to attempt a gentle deskew before splitting
         overwrite: Whether to overwrite existing outputs
         suffixes: Comma-separated suffixes for halves (e.g., "L,R")
 
@@ -346,17 +361,18 @@ def run_split_scan_pages(
     for img_path in images:
         try:
             with Image.open(img_path) as im:
-                # 1) straighten + crop page
-                fixed = straighten_and_crop_page(
+                prepared = _prepare_image_for_split(
                     im,
-                    margin_trim_px=trim,
-                    pad_px=pad,
-                    small_deskew=True,
-                    trim_lightness_offset=trim_offset,
+                    apply_deskew=deskew,
                 )
-                # 2) split
+                # split using detected seam
                 a, b = split_image_center(
-                    fixed, mode=mode, gutter_px=gutter, overlap_px=overlap
+                    prepared,
+                    mode=mode,
+                    gutter_px=gutter,
+                    overlap_px=overlap,
+                    overlap_frac=overlap_frac,
+                    auto_seam=True,
                 )
 
                 stem = img_path.stem
@@ -388,7 +404,7 @@ def run_split_scan_pages(
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Detect, straighten, crop, and split journal images."
+        description="Detect the seam in scanned spreads and split them into individual pages."
     )
     ap.add_argument("input_dir", type=Path, help="Folder with images")
     ap.add_argument("output_dir", type=Path, help="Folder to write split images")
@@ -405,28 +421,21 @@ def main():
         help="Pixels removed around the center seam (default: 0)",
     )
     ap.add_argument(
-        "--trim",
-        type=int,
-        default=8,
-        help="Re-include this many pixels around detected content (default: 8)",
-    )
-    ap.add_argument(
-        "--pad",
-        type=int,
-        default=12,
-        help="Add this many pixels of clean white margin after trimming (default: 12)",
-    )
-    ap.add_argument(
-        "--trim-offset",
-        type=float,
-        default=18.0,
-        help="Lightness offset for page detection; increase to keep more of the page (default: 18)",
-    )
-    ap.add_argument(
         "--overlap",
         type=int,
         default=0,
-        help="Pixels of overlap around the seam so both halves retain shared area (default: 0)",
+        help="Additional pixels of overlap around the seam (default: 0)",
+    )
+    ap.add_argument(
+        "--overlap-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of page width/height to keep as overlap on both halves (default: 0.1)",
+    )
+    ap.add_argument(
+        "--no-deskew",
+        action="store_true",
+        help="Disable the small-angle deskew before seam detection",
     )
     ap.add_argument(
         "--overwrite", action="store_true", help="Overwrite existing outputs"
@@ -441,10 +450,9 @@ def main():
         output_dir=args.output_dir,
         mode=args.mode,
         gutter=args.gutter,
-        trim=args.trim,
-        pad=args.pad,
-        trim_offset=args.trim_offset,
         overlap=args.overlap,
+        overlap_frac=args.overlap_frac,
+        deskew=not args.no_deskew,
         overwrite=args.overwrite,
         suffixes=args.suffixes,
     )
